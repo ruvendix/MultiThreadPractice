@@ -1,12 +1,13 @@
-#include <cstdio>
-
 #include <iostream>
 #include <thread>
+#include <mutex>
 
+std::mutex g_mutex; // º¸ÅëÀº ¸â¹ö·Î µÒ
 int g_sharedNum = 0;
 
 void ThreadFunc()
 {
+	std::lock_guard<std::mutex> lock(g_mutex);
 	for (int i = 0; i < 100000; ++i)
 	{
 		++g_sharedNum;
