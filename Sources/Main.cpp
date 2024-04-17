@@ -3,9 +3,14 @@
 #include <iostream>
 #include <thread>
 
+int g_sharedNum = 0;
+
 void ThreadFunc()
 {
-	std::cout << "Thread Id( " << std::this_thread::get_id() << " )";
+	for (int i = 0; i < 100000; ++i)
+	{
+		++g_sharedNum;
+	}
 }
 
 int main()
@@ -13,13 +18,11 @@ int main()
 	std::cout << "Thread hardware_concurrency(" << std::thread::hardware_concurrency() << ")\n";
 
 	std::thread t1(ThreadFunc);
-
-	for (int i = 0; i < 60; ++i)
-	{
-		printf("%d\n", i);
-	}
+	std::thread t2(ThreadFunc);
 
 	t1.join();
+	t2.join();
 
+	std::cout << "shared num: " << g_sharedNum << std::endl;
 	return 0;
 }
