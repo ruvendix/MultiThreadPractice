@@ -1,29 +1,34 @@
 #include <iostream>
+#include <future>
 #include <thread>
-#include <mutex>
+#include <chrono>
 
-std::mutex g_mutex; // 보통은 멤버로 둠
-int g_sharedNum = 0;
-
-void ThreadFunc()
+int ThreadFunc()
 {
-	std::lock_guard<std::mutex> lock(g_mutex);
-	for (int i = 0; i < 100000; ++i)
-	{
-		++g_sharedNum;
-	}
+	// 해당 쓰레드에서 4초 쉼
+	std::this_thread::sleep_for(std::chrono_literals::operator""s(4ull));
+	return 10;
 }
 
 int main()
 {
-	std::cout << "Thread hardware_concurrency(" << std::thread::hardware_concurrency() << ")\n";
+	std::future<int> future = std::async(std::launch::async, &ThreadFunc);
 
-	std::thread t1(ThreadFunc);
-	std::thread t2(ThreadFunc);
+	auto timePoint = std::chrono::steady_clock::now();
 
-	t1.join();
-	t2.join();
+	// 4초 동안 딴 짓 가능함
+	for (int i = 0; i < 100000; ++i)
+	{
+		for (int j = 0; j < 200000; ++j)
+		{
 
-	std::cout << "shared num: " << g_sharedNum << std::endl;
+		}
+	}
+
+	auto diffTimePoint = std::chrono::steady_clock::now() - timePoint;
+
+	std::cout << "걸린 시간: " << std::chrono::duration<float>(diffTimePoint).count() << std::endl;
+	std::cout << future.get(); // 비동기로 실행중
+	
 	return 0;
 }
