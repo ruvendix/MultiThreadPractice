@@ -1,95 +1,172 @@
 #include <iostream>
+#include <vector>
+#include <queue>
 #include <thread>
 #include <chrono>
 #include <mutex>
-#include <atomic>
+#include <condition_variable>
+#include <future>
+#include <type_traits>
+#include <functional>
 
-int g_num = 0;
+using namespace std::chrono_literals;
 
-// 락프리
-class SpinLock
+// 쓰레드풀
+class RxThreadPool
 {
 public:
-	SpinLock() = default;
-	~SpinLock() = default;
-	
-	void Lock()
+	RxThreadPool();
+	~RxThreadPool();
+
+	// 일 들어왔다!
+	template <typename TTaskFunc, typename... Args>
+	std::future<std::invoke_result_t<TTaskFunc, Args...>> AddTask(int taskIdx, TTaskFunc&& taskFunc, Args... args)
 	{
-		bool bExpected = false;
-		bool bDesire = true;
+		using ReturnType = std::invoke_result_t<TTaskFunc, Args...>;
+		using PackagedTask = std::packaged_task<ReturnType(void)>;
 
 		/*
-		m_lockFlag와 bExpected가 같으면 m_lockFlag를 bDesire로 설정하고 true 반환
-		m_lockFlag와 bExpected가 다르면 bExpected를 m_lockFlag로 설정하고 false 반환
-		이러한 구조로 스핀락을 구현할 때는 스핀이 false를 반환하면 bExpected를 false로 넣어야함
+		std::bind()로 함수 객체를 만들 때 인자들을 전달한 함수에 bind하므로
+		bind된 함수 객체를 저장하는 쪽에서는 매개변수를 void로 정할 수 있음.
+		반환값이 필요하다면 저장하는 쪽에서 반환 형식을 명시하면됨		
 		*/
-		while (m_lockFlag.compare_exchange_strong(bExpected, bDesire) == false)
+		auto bindTask = std::bind(taskFunc, std::forward<Args>(args)...);
+		std::shared_ptr<PackagedTask> spTask = std::make_shared<PackagedTask>(bindTask);
+		
+		// task는 local에서 생성하므로 queue에 유지시키려면 heap으로 넘겨야함
+		TaskInfo taskInfo;
+		taskInfo.taskFunc = [spTask]() { (*spTask)(); };
 		{
-			bExpected = false;
+			std::scoped_lock lock(m_mutex);
+			taskInfo.taskIdx = taskIdx;
+			m_taskQueue.push(taskInfo);
 		}
+		
+		m_conditionVar.notify_one();
+		return (spTask->get_future());
 	}
 
-	void Unlock()
-	{
-		m_lockFlag.store(false);
-	}
+	// 쓰레드 전용 함수
+	void DoWork();
 
 private:
-	std::atomic<bool> m_lockFlag = false;
-};
+	int m_hardwareConcurrencyThreadCount = 0;
+	std::vector<std::thread> m_threads;
 
-void LockThreadFunc(std::mutex* pMutex)
-{
-	std::lock_guard<std::mutex> lock(*pMutex);
-	for (int i = 0; i < 10000000; ++i)
+	std::mutex m_mutex; // Lock-based
+	std::condition_variable m_conditionVar;
+
+	using TaskFuncType = std::function<void(void)>;
+
+	struct TaskInfo
 	{
-		++g_num;
+		TaskFuncType taskFunc;
+		int taskIdx = 0;
+	};
+
+	std::queue<TaskInfo> m_taskQueue;
+	bool m_bAllStop = false;
+};
+///////////////////////////////////////////////////////////////////////////////////
+RxThreadPool::RxThreadPool()
+{
+	m_hardwareConcurrencyThreadCount = std::thread::hardware_concurrency();
+
+	for (int i = 0; i < m_hardwareConcurrencyThreadCount; ++i)
+	{
+		m_threads.push_back(std::thread(&RxThreadPool::DoWork, this));
 	}
 }
 
-void SpinLockThreadFunc(SpinLock* pSpinLock)
-{	
-	pSpinLock->Lock();
-	for (int i = 0; i < 10000000; ++i)
+RxThreadPool::~RxThreadPool()
+{
+	m_bAllStop = true;
+	m_conditionVar.notify_all();
+
+	for (std::thread& refThread : m_threads)
 	{
-		++g_num;
+		refThread.join();
 	}
-	pSpinLock->Unlock();
+}
+
+void RxThreadPool::DoWork()
+{
+	while (true)
+	{
+		TaskInfo taskInfo;
+
+		{
+			std::unique_lock<std::mutex> lock(m_mutex);
+			m_conditionVar.wait(lock, [this]() { return ((m_taskQueue.empty() == false) || (m_bAllStop == true)); });
+
+			// 작업할 게 없는데 중단 시그널이 왔으면 탈출 (락은 자동 해제)
+			if ((m_bAllStop == true) &&
+				(m_taskQueue.empty() == true))
+			{
+				return;
+			}
+
+			taskInfo = std::move(m_taskQueue.front());
+			m_taskQueue.pop();
+
+			// ThreadId도 하나의 객체라 이렇게 사용하는 건 올바르지 않음
+			printf("Thread Id(%d)는 (%d)번 일 처리!\n", std::this_thread::get_id(), taskInfo.taskIdx);
+		}
+
+		//std::this_thread::sleep_for(std::chrono_literals::operator""ms(1ull)); // 1ms 슬립
+		std::this_thread::sleep_for(1s); // 1ms 슬립
+		taskInfo.taskFunc();
+	}
+}
+
+int work1(int num1, int num2)
+{
+	printf("Thread Id(%d)가 task 처리!\n", std::this_thread::get_id());
+	return (num1 + num2);
+}
+
+float work2(float num1, float num2)
+{
+	printf("Thread Id(%d)가 task 처리!\n", std::this_thread::get_id());
+	return (num1 + num2);
+}
+
+class GreatWork
+{
+public:
+	GreatWork() = default;
+};
+
+void work3(GreatWork greatWork)
+{
+	printf("Thread Id(%d)가 task 처리!\n", std::this_thread::get_id());
 }
 
 int main()
 {
-#pragma region 락
-	auto lockStartTime = std::chrono::steady_clock::now();
+	RxThreadPool rxThreadPool;
 
-	std::mutex mutex;
-	std::thread lockThread1(LockThreadFunc, &mutex);
-	std::thread lockThread2(LockThreadFunc, &mutex);
+	// 서브 쓰레드의 결과를 받으려면 메인 쓰레드도 기다려야함...
+	//std::cout << "work1: " << rxThreadPool.AddTask(0, work1, 10, 20).get() << std::endl << std::endl;
+	//std::cout << "work2: " << rxThreadPool.AddTask(1, work2, 24.02f, 12.62f).get() << std::endl << std::endl;
 
-	lockThread1.join();
-	lockThread2.join();
+	//std::cout << "work3: ";
+	//rxThreadPool.AddTask(2, work3, GreatWork()); // 반환
 
-	auto diffLockTime = (std::chrono::steady_clock::now() - lockStartTime);
-	std::cout << "락 결과: " << g_num << std::endl;
-	std::cout << "경과 시간: " << std::chrono::duration<float>(diffLockTime).count() << "초" << std::endl << std::endl;
-#pragma endregion
+	std::vector<std::future<int>> m_futures;
+	for (int i = 0; i < 5; ++i)
+	{
+		m_futures.push_back(rxThreadPool.AddTask(i + 3, work1, 10, 20));
+	}
 
-	g_num = 0;
+	// 메인 쓰레드는 서브 쓰레드의 작업 결과를 기다리지 않고 다른 일을 처리하는 게 가능
+	std::cout << "메인 쓰레드의 등장!\n";
 
-#pragma region 스핀락
-	auto spinLockStartTime = std::chrono::steady_clock::now();
-
-	SpinLock spinLock;
-	std::thread spinLockThread1(SpinLockThreadFunc, &spinLock);
-	std::thread spinLockThread2(SpinLockThreadFunc, &spinLock);
-
-	spinLockThread1.join();
-	spinLockThread2.join();
-
-	auto diffSpinLockTime = (std::chrono::steady_clock::now() - spinLockStartTime);
-	std::cout << "스핀락 결과: " << g_num << std::endl;
-	std::cout << "경과 시간: " << std::chrono::duration<float>(diffSpinLockTime).count() << "초" << std::endl;
-#pragma endregion
+	for (int i = 0; i < 5; ++i)
+	{
+		int ret = m_futures[i].get();
+		printf("work1 결과: %d\n", ret);
+	}
 
 	return 0;
 }
